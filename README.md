@@ -1,36 +1,38 @@
 # ARC-LLM
 
-This repository now separates the µARC implementation into its own folder:
+This repository contains two tracks:
 
-- `mu_arc_llm/` → canonical **µARC-LLM v0.1** implementation
-- `arc_llm/` → compatibility wrappers that re-export the µARC model API
+- `mu_arc_llm/`: canonical µARC-LLM micro-transformer package.
+- `arc_llm/`: compatibility wrappers for previous import paths.
 
-## µARC-LLM (separate folder)
+## Unified prototype
 
-mini, runnable curvature-aware language model prototype with:
+A single-file unified architecture is also provided in `arc_llm_unified.py` with:
 
-- low-rank metric `g = A^T A + λI`
-- geodesic attention `softmax(-d_g(x_i, x_j)^2)`
-- residual + tangent MLP blocks
-- optional curvature regularization
+- tensor sharding (`TensorShard`, `ShardedModel`)
+- geometric attention (`RiemannianMetric`, `GeodesicAttention`)
+- complete model (`ARCLLMUnified`)
+- geometry exporters (`GeometricExporter`)
+- PowerShell runner generation (`generate_powershell_runner`)
 
-## Minimal usage (new canonical path)
+A basic PowerShell entrypoint is included at `arc_runner.ps1`.
+
+## Quick example
 
 ```python
 import torch
-from mu_arc_llm import MuARCLLM, MuARCConfig, train_step
+from arc_llm_unified import ARCLLMUnified, GeometricExporter
 
-cfg = MuARCConfig(vocab_size=1000, dim=64, depth=2, hidden_dim=128, rank=16)
-model = MuARCLLM(cfg)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-
+model = ARCLLMUnified(vocab_size=1000, dim=64, depth=2, num_heads=4, rank=8)
 input_ids = torch.randint(0, 1000, (2, 12))
-targets = torch.randint(0, 1000, (2, 12))
+logits = model(input_ids)
 
-loss = train_step(model, optimizer, input_ids, targets, curvature_weight=1e-3)
-print(loss)
+model.save_sharded("arc_model_shards", shard_size_mb=1)
+exporter = GeometricExporter(model)
+svg = exporter.export_metric_as_svg(0, 0)
+xml = exporter.export_full_geometry_xml()
 ```
 
 ## Backward compatibility
 
-Legacy imports from `arc_llm` still work via aliases/re-exports.
+Legacy imports from `arc_llm` continue to work via alias/re-export to `mu_arc_llm`.

@@ -1,9 +1,12 @@
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from mu_arc_llm import MuARCConfig, MuARCLLM, train_step
 from arc_llm import ARCLLM, ARCConfig
+from arc_llm_unified import ARCLLMUnified, GeometricExporter, ShardedModel
+from mu_arc_llm import MuARCConfig, MuARCLLM, train_step
 
 
 def test_mu_arc_forward_shape():
@@ -32,3 +35,22 @@ def test_arc_compatibility_aliases():
     tokens = torch.randint(0, cfg.vocab_size, (1, 4))
     logits = model(tokens)
     assert logits.shape == (1, 4, cfg.vocab_size)
+
+
+def test_unified_shard_roundtrip(tmp_path: Path):
+    model = ARCLLMUnified(vocab_size=64, dim=16, depth=1, num_heads=4, rank=4)
+    out_dir = tmp_path / "shards"
+    model.save_sharded(str(out_dir), shard_size_mb=1)
+
+    manager = ShardedModel(str(out_dir), max_cache=2)
+    loaded = manager.get_tensor("embed.weight")
+    assert loaded.shape == model.embed.weight.shape
+
+
+def test_unified_exporters_generate_strings():
+    model = ARCLLMUnified(vocab_size=64, dim=16, depth=1, num_heads=4, rank=4)
+    exporter = GeometricExporter(model)
+    svg = exporter.export_metric_as_svg(0, 0)
+    xml = exporter.export_full_geometry_xml()
+    assert "<svg" in svg
+    assert "<arc-llm" in xml
