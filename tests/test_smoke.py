@@ -5,7 +5,14 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from arc_llm import ARCLLM, ARCConfig
-from arc_llm_unified import ARCLLMUnified, GeometricExporter, ShardedModel
+from arc_llm_unified import (
+    ARCLLMUnified,
+    GeometricExporter,
+    RiemannianMetric,
+    ShardedModel,
+    TensorShard,
+    train_step_with_metrics,
+)
 from mu_arc_llm import MuARCConfig, MuARCLLM, train_step
 
 
@@ -37,6 +44,15 @@ def test_arc_compatibility_aliases():
     assert logits.shape == (1, 4, cfg.vocab_size)
 
 
+def test_position_dependent_metric_shape_and_psd():
+    metric = RiemannianMetric(dim=8, rank=4, position_dependent=True)
+    x = torch.randn(2, 3, 8)
+    g = metric(x)
+    assert g.shape == (2, 3, 8, 8)
+    diag = torch.diagonal(g, dim1=-2, dim2=-1)
+    assert torch.all(diag > 0)
+
+
 def test_unified_shard_roundtrip(tmp_path: Path):
     model = ARCLLMUnified(vocab_size=64, dim=16, depth=1, num_heads=4, rank=4)
     out_dir = tmp_path / "shards"
@@ -45,6 +61,31 @@ def test_unified_shard_roundtrip(tmp_path: Path):
     manager = ShardedModel(str(out_dir), max_cache=2)
     loaded = manager.get_tensor("embed.weight")
     assert loaded.shape == model.embed.weight.shape
+
+
+def test_tensor_shard_header_and_index_roundtrip(tmp_path: Path):
+    shard_path = tmp_path / "single.tsr"
+    writer = TensorShard(str(shard_path), mode="w", shard_id=3)
+    tensor = torch.randn(4, 5)
+    writer.write_tensor("w", tensor)
+    writer.close()
+
+    reader = TensorShard(str(shard_path), mode="r")
+    assert reader.header.shard_id == 3
+    assert reader.header.num_tensors == 1
+    reloaded = reader.get_tensor("w")
+    assert reloaded.shape == tensor.shape
+    reader.close()
+
+
+def test_unified_train_step_metrics_keys():
+    model = ARCLLMUnified(vocab_size=64, dim=16, depth=1, num_heads=4, rank=4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    input_ids = torch.randint(0, 64, (2, 6))
+    targets = torch.randint(0, 64, (2, 6))
+
+    m = train_step_with_metrics(model, optimizer, input_ids, targets)
+    assert {"total_loss", "lm_loss", "curvature_loss", "grad_norm"}.issubset(m.keys())
 
 
 def test_unified_exporters_generate_strings():

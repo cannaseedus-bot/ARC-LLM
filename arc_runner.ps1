@@ -1,7 +1,6 @@
 param(
     [string]$Command = "info",
-    [string]$ModelPath = "arc_model_shards",
-    [string]$Prompt = "Once upon a time"
+    [string]$ModelPath = "arc_model_shards"
 )
 
 function Show-ARCLogo {
@@ -14,8 +13,10 @@ function Get-ShardInfo {
         Write-Host "Manifest not found at $Path" -ForegroundColor Yellow
         return
     }
+
     $manifest = Get-Content "$Path/manifest.json" | ConvertFrom-Json
     Write-Host "Shards: $($manifest.num_shards)" -ForegroundColor Green
+    Write-Host "Config: vocab=$($manifest.config.vocab_size), dim=$($manifest.config.dim), depth=$($manifest.config.depth)" -ForegroundColor Gray
 }
 
 Show-ARCLogo
