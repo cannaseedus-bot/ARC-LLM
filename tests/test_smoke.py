@@ -132,6 +132,15 @@ def test_hybrid_ball_shapes():
     assert d.shape == (2, 4)
 
 
+
+
+def test_hybrid_per_head_curvatures_positive():
+    cfg = HybridARCConfig(vocab_size=128, dim_e=16, dim_h=16, depth=2, num_heads=4, c=1.0)
+    model = HybridARC(cfg)
+    curv = model.head_curvatures()
+    assert curv.shape == (cfg.num_heads,)
+    assert torch.all(curv > 0)
+
 def test_hybrid_arc_forward_shape():
     cfg = HybridARCConfig(vocab_size=256, dim_e=16, dim_h=16, depth=2, num_heads=4, c=1.0)
     model = HybridARC(cfg)

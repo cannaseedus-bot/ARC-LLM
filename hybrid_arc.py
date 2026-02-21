@@ -24,45 +24,47 @@ class PoincareBall(nn.Module):
             raise ValueError("Curvature parameter c must be positive")
         self.register_buffer("c", torch.tensor(float(c)))
 
-    def _c_like(self, ref: torch.Tensor) -> torch.Tensor:
-        return self.c.to(device=ref.device, dtype=ref.dtype)
+    def _c_like(self, ref: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
+        if c is None:
+            return self.c.to(device=ref.device, dtype=ref.dtype)
+        return c.to(device=ref.device, dtype=ref.dtype)
 
-    def _sqrt_c(self, ref: torch.Tensor) -> torch.Tensor:
-        return self._c_like(ref).sqrt()
+    def _sqrt_c(self, ref: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
+        return self._c_like(ref, c).sqrt()
 
-    def project(self, x: torch.Tensor, margin: float = 1e-3) -> torch.Tensor:
-        sqrt_c = self._sqrt_c(x)
+    def project(self, x: torch.Tensor, c: torch.Tensor | None = None, margin: float = 1e-3) -> torch.Tensor:
+        sqrt_c = self._sqrt_c(x, c)
         max_norm = (1.0 - margin) / sqrt_c
         norm = torch.norm(x, dim=-1, keepdim=True).clamp_min(EPS)
         scale = torch.clamp(max_norm / norm, max=1.0)
         return x * scale
 
-    def mobius_add(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        c = self._c_like(x)
+    def mobius_add(self, x: torch.Tensor, y: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
+        c_val = self._c_like(x, c)
         x2 = (x * x).sum(dim=-1, keepdim=True)
         y2 = (y * y).sum(dim=-1, keepdim=True)
         xy = (x * y).sum(dim=-1, keepdim=True)
-        num = (1 + 2 * c * xy + c * y2) * x + (1 - c * x2) * y
-        den = 1 + 2 * c * xy + (c * c) * x2 * y2
+        num = (1 + 2 * c_val * xy + c_val * y2) * x + (1 - c_val * x2) * y
+        den = 1 + 2 * c_val * xy + (c_val * c_val) * x2 * y2
         out = num / den.clamp_min(EPS)
-        return self.project(out)
+        return self.project(out, c=c_val)
 
-    def exp0(self, v: torch.Tensor) -> torch.Tensor:
-        sqrt_c = self._sqrt_c(v)
+    def exp0(self, v: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
+        sqrt_c = self._sqrt_c(v, c)
         norm = torch.norm(v, dim=-1, keepdim=True).clamp_min(EPS)
         out = torch.tanh(sqrt_c * norm) * v / (sqrt_c * norm)
-        return self.project(out)
+        return self.project(out, c=c)
 
-    def log0(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.project(x)
-        sqrt_c = self._sqrt_c(x)
+    def log0(self, x: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.project(x, c=c)
+        sqrt_c = self._sqrt_c(x, c)
         norm = torch.norm(x, dim=-1, keepdim=True).clamp_min(EPS)
         scaled = (sqrt_c * norm).clamp_max(1 - 1e-5)
         return torch.atanh(scaled) * x / (sqrt_c * norm)
 
-    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        sqrt_c = self._sqrt_c(x)
-        diff = self.mobius_add(-x, y)
+    def dist(self, x: torch.Tensor, y: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
+        sqrt_c = self._sqrt_c(x, c)
+        diff = self.mobius_add(-x, y, c=c)
         norm = torch.norm(diff, dim=-1).clamp_max((1 - 1e-5) / sqrt_c)
         return (2.0 / sqrt_c) * torch.atanh((sqrt_c * norm).clamp_max(1 - 1e-5))
 
@@ -90,8 +92,12 @@ class HybridAttention(nn.Module):
         self.total_dim = dim_e + dim_h
         if self.total_dim % num_heads != 0:
             raise ValueError("(dim_e + dim_h) must be divisible by num_heads")
+        if dim_e % num_heads != 0 or dim_h % num_heads != 0:
+            raise ValueError("dim_e and dim_h must each be divisible by num_heads for per-head geometry")
         self.num_heads = num_heads
         self.head_dim = self.total_dim // num_heads
+        self.head_dim_e = dim_e // num_heads
+        self.head_dim_h = dim_h // num_heads
         self.ball = PoincareBall(c)
 
         self.q_proj = nn.Linear(self.total_dim, self.total_dim)
@@ -99,38 +105,56 @@ class HybridAttention(nn.Module):
         self.v_proj = nn.Linear(self.total_dim, self.total_dim)
         self.out_proj = nn.Linear(self.total_dim, self.total_dim)
 
-        # alpha >= 0 via softplus
-        self.alpha_unconstrained = nn.Parameter(torch.tensor(0.0))
+        # per-head hybrid weighting alpha_h >= 0
+        self.alpha_unconstrained = nn.Parameter(torch.zeros(num_heads))
+        # per-head curvature: c_h = softplus(global + head) + eps
+        self.global_curvature_unconstrained = nn.Parameter(torch.tensor(c))
+        self.curvature_unconstrained = nn.Parameter(torch.zeros(num_heads))
 
-    def _split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return x[..., : self.dim_e], x[..., self.dim_e :]
+    def curvature_values(self) -> torch.Tensor:
+        return F.softplus(self.global_curvature_unconstrained + self.curvature_unconstrained) + 1e-4
+
+    def alpha_values(self) -> torch.Tensor:
+        return F.softplus(self.alpha_unconstrained)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq, _ = x.shape
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q = self.q_proj(x).view(bsz, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(bsz, seq, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(bsz, seq, self.num_heads, self.head_dim).transpose(1, 2)
 
-        qe, qh = self._split(q)
-        ke, kh = self._split(k)
+        curvatures = self.curvature_values()
+        alphas = self.alpha_values()
 
-        # Euclidean term
-        qe_exp = qe.unsqueeze(2)  # [B,T,1,De]
-        ke_exp = ke.unsqueeze(1)  # [B,1,T,De]
-        d_e = ((qe_exp - ke_exp) ** 2).sum(dim=-1)
+        outputs = []
+        for h in range(self.num_heads):
+            qh = q[:, h]  # [B,T,Hd]
+            kh = k[:, h]
+            vh = v[:, h]
 
-        # Hyperbolic term
-        qh_h = self.ball.exp0(qh)
-        kh_h = self.ball.exp0(kh)
-        qh_exp = qh_h.unsqueeze(2).expand(-1, -1, seq, -1)
-        kh_exp = kh_h.unsqueeze(1).expand(-1, seq, -1, -1)
-        d_h = self.ball.dist(qh_exp, kh_exp)
+            qe = qh[..., : self.head_dim_e]
+            qhyp = qh[..., self.head_dim_e :]
+            ke = kh[..., : self.head_dim_e]
+            khyp = kh[..., self.head_dim_e :]
 
-        alpha = F.softplus(self.alpha_unconstrained)
-        dist = d_e + alpha * (d_h**2)
-        logits = (-dist / math.sqrt(max(self.total_dim, 1))).clamp(min=-50.0, max=0.0)
-        attn = F.softmax(logits, dim=-1)
-        out = torch.matmul(attn, v)
+            qe_exp = qe.unsqueeze(2)
+            ke_exp = ke.unsqueeze(1)
+            d_e = ((qe_exp - ke_exp) ** 2).sum(dim=-1)
+
+            c_h = curvatures[h]
+            qhyp = self.ball.exp0(qhyp, c=c_h)
+            khyp = self.ball.exp0(khyp, c=c_h)
+
+            qhyp_exp = qhyp.unsqueeze(2).expand(-1, -1, seq, -1)
+            khyp_exp = khyp.unsqueeze(1).expand(-1, seq, -1, -1)
+            d_h = self.ball.dist(qhyp_exp, khyp_exp, c=c_h)
+
+            dist = d_e + alphas[h] * (d_h**2)
+            logits = (-dist / math.sqrt(max(self.head_dim, 1))).clamp(min=-50.0, max=0.0)
+            attn = F.softmax(logits, dim=-1)
+            outputs.append(torch.matmul(attn, vh))
+
+        out = torch.cat(outputs, dim=-1)
         return self.out_proj(out)
 
 
@@ -197,6 +221,9 @@ class HybridARC(nn.Module):
 
     def _split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return x[..., : self.config.dim_e], x[..., self.config.dim_e :]
+
+    def head_curvatures(self) -> torch.Tensor:
+        return self.layers[0].attn.curvature_values()
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed(input_ids)

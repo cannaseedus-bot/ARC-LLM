@@ -17,8 +17,9 @@ This repository contains four tracks:
 with hybrid distance attention:
 
 - Euclidean distance term: `||q_e - k_e||^2`
-- Hyperbolic distance term: `alpha * d_hyp(q_h, k_h)^2`
-- `alpha` is learnable and constrained non-negative via `softplus`
+- Hyperbolic distance term: `alpha_h * d_hyp,c_h(q_h, k_h)^2`
+- `alpha_h` is learnable per-head and constrained non-negative via `softplus`
+- `c_h` is learnable per-head curvature (`c_h = softplus(c_global + c_head_h)`)
 
 Residual updates are split by geometry:
 
